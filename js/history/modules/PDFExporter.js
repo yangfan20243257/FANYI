@@ -19,7 +19,7 @@ class PDFExporter {
     try {
       if (!originalPdfBase64 || !Array.isArray(translatedContentList)) throw new Error('缺少原 PDF 或结构化译文，请重新处理原文件。');
       const failed = translatedContentList.filter(item => item && item.type === 'text' && item.failed);
-      if (failed.length) throw new Error(`还有 ${failed.length} 段正文翻译失败，请先重试失败段。`);
+      if (failed.length && notify) notify(`有 ${failed.length} 段翻译失败，PDF 将保留该段现有文字。`,'warning');
       const items = translatedContentList.filter(item => item && item.type === 'text' && typeof item.text === 'string' && item.text.trim());
       if (!items.length) throw new Error('没有正文译文可导出。');
       if (notify) notify('正在生成保留页面布局的译文 PDF…', 'info');
@@ -32,35 +32,40 @@ class PDFExporter {
       // 完整嵌入静态字体，避免多段中文子集的字形映射缺失。
       const font = await doc.embedFont(await response.arrayBuffer(), { subset: false });
       const plans = [];
+      const fallback = [];
+      const originalPageCount=doc.getPageCount();
 
       const protectedTypes = new Set(['image', 'table', 'formula', 'equation', 'isolate_formula']);
       for (const [index,item] of items.entries()) {
         const pageIndex = item.page_idx;
         const box = item.bbox;
         const range = this.options.bboxNormalizedRange;
-        if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= doc.getPageCount() || !Array.isArray(box) || box.length !== 4 ||
+        if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= originalPageCount || !Array.isArray(box) || box.length !== 4 ||
           !box.every(Number.isFinite) || box[0] < 0 || box[1] < 0 || box[2] > range || box[3] > range || box[2] <= box[0] || box[3] <= box[1]) {
-          throw new Error(`第 ${index+1} 段缺少有效页码或文字坐标，不能可靠地恢复版式。`);
+          fallback.push({pageIndex:Number.isInteger(pageIndex)?pageIndex:0,paragraphIndex:index+1,text:item.text}); continue;
         }
         const page = doc.getPage(pageIndex);
-        if (page.getRotation().angle % 360 !== 0) throw new Error(`第 ${pageIndex+1} 页有旋转，请先将原 PDF 页面转正再处理。`);
-        // 错误的文字框不应擦掉图、表或独立公式。
-        for (const other of translatedContentList) {
-          if (!other || other.page_idx !== pageIndex || !protectedTypes.has(other.type) || !Array.isArray(other.bbox)) continue;
-          const overlapWidth = Math.min(box[2],other.bbox[2]) - Math.max(box[0],other.bbox[0]);
-          const overlapHeight = Math.min(box[3],other.bbox[3]) - Math.max(box[1],other.bbox[1]);
-          if (overlapWidth > 1 && overlapHeight > 1) throw new Error(`第 ${pageIndex+1} 页的正文框与图表或公式重叠，已停止导出以避免覆盖原内容。`);
-        }
+        if (page.getRotation().angle % 360 !== 0) {fallback.push({pageIndex,paragraphIndex:index+1,text:item.text});continue;}
         const size = page.getSize();
-        const top = size.height - box[1] / range * size.height;
-        const height = (box[3]-box[1]) / range * size.height;
+        let top = size.height - box[1] / range * size.height;
+        let height = (box[3]-box[1]) / range * size.height;
         const text = item.text.replace(/\r\n?/g,'\n').replace(/\t/g,'    ').trim();
         const heading = item.text_level > 0;
         const preferred = heading ? 18 : 10.5;
         let x = box[0] / range * size.width;
         let width = (box[2]-box[0]) / range * size.width;
+        const obstacles=translatedContentList.filter(other=>other && other.page_idx===pageIndex && protectedTypes.has(other.type) && Array.isArray(other.bbox) && other.bbox.length===4 && other.bbox.every(Number.isFinite)).map(other=>({x:other.bbox[0]/range*size.width,y:other.bbox[1]/range*size.height,width:(other.bbox[2]-other.bbox[0])/range*size.width,height:(other.bbox[3]-other.bbox[1])/range*size.height}));
+        const initial={x,y:size.height-top,width,height};
+        const safe=this.findFreeRectangle(initial,obstacles);
+        if(!safe) {
+          const otherBoxes=translatedContentList.filter(other=>other && other.page_idx===pageIndex && Array.isArray(other.bbox) && other.bbox.length===4 && other.bbox.every(Number.isFinite)).map(other=>({x:other.bbox[0]/range*size.width,y:other.bbox[1]/range*size.height,width:(other.bbox[2]-other.bbox[0])/range*size.width,height:(other.bbox[3]-other.bbox[1])/range*size.height}));
+          const spare=this.findFreeRectangle({x:12,y:12,width:size.width-24,height:size.height-24},otherBoxes.concat(plans.filter(plan=>plan.pageIndex===pageIndex).map(plan=>({x:plan.x,y:size.height-plan.top,width:plan.width,height:plan.height}))));
+          if(!spare){fallback.push({pageIndex,paragraphIndex:index+1,text});continue;}
+          x=spare.x;top=size.height-spare.y;width=spare.width;height=spare.height;
+        } else {x=safe.x;top=size.height-safe.y;width=safe.width;height=safe.height;}
+        const changed=!safe || safe.x!==initial.x || safe.y!==initial.y || safe.width!==initial.width || safe.height!==initial.height;
         let layout = this.calculatePdfTextLayout(font,text,width,height,heading,true,preferred);
-        if (!layout.fits || layout.fontSize < preferred*0.95) {
+        if (!changed && (!layout.fits || layout.fontSize < preferred*0.95)) {
           const expanded = this.expandHorizontalBox(item,translatedContentList,size,plans);
           x=expanded.x; width=expanded.width;
           layout=this.calculatePdfTextLayout(font,text,width,height,heading,true,preferred);
@@ -82,6 +87,11 @@ class PDFExporter {
           page.drawText(line, {x:x+layout.padding,y:top-layout.padding-layout.fontSize-index*layout.lineHeight,
             size:layout.fontSize,font,color:PDFLib.rgb(0,0,0)});
         });
+      }
+      if(fallback.length) {
+        this.appendFallbackPages(doc,font,fallback);
+        if(notify)notify(`有 ${fallback.length} 段因原页无可用空间或坐标异常，完整文字已放入附页。`,'warning');
+        else if(typeof window!=='undefined' && typeof window.showNotification==='function')window.showNotification(`有 ${fallback.length} 段完整文字已放入附页。`,'warning');
       }
       const small=plans.filter(plan=>plan.layout.fontSize<this.options.compactMinFontSize);
       if(small.length) {
@@ -108,6 +118,56 @@ class PDFExporter {
       if (options.download === false) throw error;
       console.error('[PDFExporter]',error);
       return null;
+    }
+  }
+
+  findFreeRectangle(region,obstacles) {
+    let spaces=[region];
+    for(const obstacle of obstacles) {
+      if(obstacle.width<=0 || obstacle.height<=0)continue;
+      const next=[];
+      for(const r of spaces) {
+        const left=Math.max(r.x,obstacle.x),right=Math.min(r.x+r.width,obstacle.x+obstacle.width);
+        const top=Math.max(r.y,obstacle.y),bottom=Math.min(r.y+r.height,obstacle.y+obstacle.height);
+        if(right<=left || bottom<=top){next.push(r);continue;}
+        next.push({x:r.x,y:r.y,width:left-r.x,height:r.height},
+          {x:right,y:r.y,width:r.x+r.width-right,height:r.height},
+          {x:r.x,y:r.y,width:r.width,height:top-r.y},
+          {x:r.x,y:bottom,width:r.width,height:r.y+r.height-bottom});
+      }
+      spaces=next.filter(r=>r.width>0.01 && r.height>0.01).sort((a,b)=>b.width*b.height-a.width*a.height).slice(0,256);
+      if(!spaces.length)return null;
+    }
+    return spaces.sort((a,b)=>b.width*b.height-a.width*a.height)[0] || null;
+  }
+
+  appendFallbackPages(doc,font,items) {
+    const width=595.28,height=841.89,margin=42;
+    const fontSize=10.5,lineHeight=14;
+    let page,cursor,pageNumber=0;
+    const newPage=(item,continuation=false)=>{
+      page=doc.addPage([width,height]);
+      pageNumber++;
+      page.drawText('译文附页',{x:margin,y:height-margin-16,size:16,font,color:PDFLib.rgb(0,0,0)});
+      page.drawText(`附页 ${pageNumber}`,{x:margin,y:22,size:9,font,color:PDFLib.rgb(0.35,0.35,0.35)});
+      page.drawLine({start:{x:margin,y:height-margin-28},end:{x:width-margin,y:height-margin-28},thickness:0.5,color:PDFLib.rgb(0.7,0.7,0.7)});
+      cursor=height-margin-52;
+      label(item,continuation);
+    };
+    const label=(item,continuation=false)=>{
+      page.drawText(`原第 ${item.pageIndex+1} 页，第 ${item.paragraphIndex} 段${continuation?'（续）':''}`,{x:margin,y:cursor,size:11,font,color:PDFLib.rgb(0.2,0.2,0.2)});
+      cursor-=22;
+    };
+    for(const item of items) {
+      if (!page || cursor<margin+48) newPage(item);
+      else label(item);
+      const lines=this.wrapTextForPdf(font,item.text,width-margin*2,fontSize);
+      for(const line of lines) {
+        if (cursor<margin+fontSize) newPage(item,true);
+        page.drawText(line,{x:margin,y:cursor,size:fontSize,font,color:PDFLib.rgb(0,0,0)});
+        cursor-=lineHeight;
+      }
+      cursor-=20;
     }
   }
 
