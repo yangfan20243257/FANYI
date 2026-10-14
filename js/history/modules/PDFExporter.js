@@ -10,6 +10,7 @@ class PDFExporter {
       fontkitUrl: root + 'public/vendor/fontkit.umd.min.js',
       bboxNormalizedRange: 1000,
       minFontSize: 5,
+      compactMinFontSize: 4.5,
       maxFontSize: 24
     }, options);
   }
@@ -26,11 +27,12 @@ class PDFExporter {
       const doc = await PDFLib.PDFDocument.load(this.base64ToUint8Array(originalPdfBase64));
       doc.registerFontkit(fontkit);
       const response = await fetch(this.options.fontUrl);
-      if (!response.ok) throw new Error('中文字体加载失败，请确认 public/vendor/pdf-export 文件夹已上传。');
+      if (!response.ok) throw new Error('中文字体加载失败，请确认 public/vendor 文件夹已上传。');
       // 使用 TrueType 字体，避免 CFF 子集字体在部分阅读器中的兼容性问题。
       // 完整嵌入静态字体，避免多段中文子集的字形映射缺失。
       const font = await doc.embedFont(await response.arrayBuffer(), { subset: false });
       const plans = [];
+
       const protectedTypes = new Set(['image', 'table', 'formula', 'equation', 'isolate_formula']);
       for (const [index,item] of items.entries()) {
         const pageIndex = item.page_idx;
@@ -50,14 +52,27 @@ class PDFExporter {
           if (overlapWidth > 1 && overlapHeight > 1) throw new Error(`第 ${pageIndex+1} 页的正文框与图表或公式重叠，已停止导出以避免覆盖原内容。`);
         }
         const size = page.getSize();
-        const x = box[0] / range * size.width;
         const top = size.height - box[1] / range * size.height;
-        const width = (box[2]-box[0]) / range * size.width;
         const height = (box[3]-box[1]) / range * size.height;
         const text = item.text.replace(/\r\n?/g,'\n').replace(/\t/g,'    ').trim();
-        const layout = this.calculatePdfTextLayout(font,text,width,height,item.text_level > 0);
-        if (!layout.fits) throw new Error(`第 ${pageIndex+1} 页第 ${index+1} 段译文无法完整放入原文字框。请精简译文后重试；本次不会截断文字。`);
-        plans.push({page,x,top,width,height,layout});
+        const heading = item.text_level > 0;
+        const preferred = heading ? 18 : 10.5;
+        let x = box[0] / range * size.width;
+        let width = (box[2]-box[0]) / range * size.width;
+        let layout = this.calculatePdfTextLayout(font,text,width,height,heading,true,preferred);
+        if (!layout.fits || layout.fontSize < preferred*0.95) {
+          const expanded = this.expandHorizontalBox(item,translatedContentList,size,plans);
+          x=expanded.x; width=expanded.width;
+          layout=this.calculatePdfTextLayout(font,text,width,height,heading,true,preferred);
+        }
+        if (!layout.fits) throw new Error(`第 ${pageIndex+1} 页第 ${index+1} 段译文在压紧行距、扩宽和缩小字号后仍放不下。请精简该段译文或检查 OCR 文字框后重试。`);
+        plans.push({page,pageIndex,x,top,width,height,layout,text,heading});
+      }
+      // 正文共享字号基准，段落间字号差异最多约 15%，标题单独保留层级。
+      const bodyPlans=plans.filter(plan=>!plan.heading);
+      const commonSize=bodyPlans.length ? Math.min(10.5,...bodyPlans.map(plan=>plan.layout.fontSize/0.85)) : 10.5;
+      for (const plan of plans) {
+        if (!plan.heading) plan.layout=this.calculatePdfTextLayout(font,plan.text,plan.width,plan.height,false,true,Math.min(commonSize,plan.layout.fontSize));
       }
       // 先验证所有段落，再修改页面，避免部分修改被误下载。
       for (const plan of plans) {
@@ -90,26 +105,49 @@ class PDFExporter {
     }
   }
 
-  calculatePdfTextLayout(font,text,boxWidth,boxHeight,isHeading=false) {
-    const padding = Math.min(1,boxHeight*0.03,boxWidth*0.03);
-    const availableWidth=boxWidth-padding*2;
-    const availableHeight=boxHeight-padding*2;
-    const candidate=(size)=>{
+  expandHorizontalBox(item,items,size,plans=[]) {
+    const range=this.options.bboxNormalizedRange;
+    const box=item.bbox;
+    const originalLeft=box[0]/range*size.width,originalRight=box[2]/range*size.width;
+    const top=box[1]/range*size.height,bottom=box[3]/range*size.height;
+    const grow=Math.min(60,(originalRight-originalLeft)*0.4);
+    let left=Math.max(12,originalLeft-grow),right=Math.min(size.width-12,originalRight+grow);
+    const obstacles=items.filter(other=>other && other!==item && other.page_idx===item.page_idx && Array.isArray(other.bbox) && other.bbox.length===4 && other.bbox.every(Number.isFinite)).map(other=>({left:other.bbox[0]/range*size.width,right:other.bbox[2]/range*size.width,top:other.bbox[1]/range*size.height,bottom:other.bbox[3]/range*size.height}));
+    for(const plan of plans.filter(plan=>plan.pageIndex===item.page_idx)) obstacles.push({left:plan.x,right:plan.x+plan.width,top:size.height-plan.top,bottom:size.height-plan.top+plan.height});
+    for(const obstacle of obstacles) {
+      if(obstacle.bottom<=top || obstacle.top>=bottom) continue;
+      if(obstacle.right<=originalLeft) left=Math.max(left,obstacle.right+3);
+      else if(obstacle.left>=originalRight) right=Math.min(right,obstacle.left-3);
+      else {left=originalLeft;right=originalRight;break;}
+    }
+    // 扩宽不能缩小原框，也不能跨越相邻栏或图表。
+    left=Math.min(originalLeft,left); right=Math.max(originalRight,right);
+    return {x:left,width:right-left};
+  }
+
+  calculatePdfTextLayout(font,text,boxWidth,boxHeight,isHeading=false,compact=false,preferredSize=null) {
+    const padding=Math.min(1,boxHeight*0.03,boxWidth*0.03);
+    const availableWidth=boxWidth-padding*2,availableHeight=boxHeight-padding*2;
+    const min=compact?this.options.compactMinFontSize:this.options.minFontSize;
+    const max=Math.min(this.options.maxFontSize,preferredSize ?? (isHeading?18:10.5));
+    if(availableWidth<=0 || availableHeight<=0 || min<=0 || max<min-0.01) return {fits:false};
+    const candidate=(size,leading)=>{
       const lines=this.wrapTextForPdf(font,text,availableWidth,size);
-      const lineHeight=size*1.25;
-      const fits=lines.length*lineHeight <= availableHeight && lines.every(line=>font.widthOfTextAtSize(line,size)<=availableWidth+0.01);
+      const lineHeight=size*leading;
+      const usedHeight=size+(lines.length-1)*lineHeight;
+      const fits=usedHeight<=availableHeight+0.001 && lines.every(line=>font.widthOfTextAtSize(line,size)<=availableWidth+0.01);
       return {fontSize:size,lines,lineHeight,padding,fits};
     };
-    const min=this.options.minFontSize;
-    const max=Math.min(this.options.maxFontSize,isHeading?24:12,availableHeight/1.25);
-    if (availableWidth<=0 || availableHeight<=0 || min<=0 || max<min) return {fits:false};
-    let best=candidate(min);
-    if (!best.fits) return best;
+    const leadings=compact?[1.2,1.12,1.04]:[1.25];
+    // 先保持字号压紧行距，最后才减小字号。
+    for(const leading of leadings) {const trial=candidate(max,leading);if(trial.fits)return trial;}
+    const leading=leadings[leadings.length-1];
+    let best=candidate(min,leading);
+    if(!best.fits)return best;
     let low=min,high=Math.max(min,max);
-    for (let step=0;step<18 && high-low>0.02;step++) {
-      const mid=(low+high)/2;
-      const trial=candidate(mid);
-      if (trial.fits) {best=trial;low=mid;} else high=mid;
+    for(let step=0;step<20 && high-low>0.005;step++) {
+      const mid=(low+high)/2,trial=candidate(mid,leading);
+      if(trial.fits){best=trial;low=mid;}else high=mid;
     }
     return best;
   }
