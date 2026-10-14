@@ -65,14 +65,14 @@ class PDFExporter {
           x=expanded.x; width=expanded.width;
           layout=this.calculatePdfTextLayout(font,text,width,height,heading,true,preferred);
         }
-        if (!layout.fits) throw new Error(`第 ${pageIndex+1} 页第 ${index+1} 段译文在压紧行距、扩宽和缩小字号后仍放不下。请精简该段译文或检查 OCR 文字框后重试。`);
+        if (!layout.fits) layout=this.calculatePdfTextLayout(font,text,width,height,heading,true,preferred,true);
         plans.push({page,pageIndex,x,top,width,height,layout,text,heading});
       }
-      // 正文共享字号基准，段落间字号差异最多约 15%，标题单独保留层级。
-      const bodyPlans=plans.filter(plan=>!plan.heading);
+      // 正文共享字号基准，常规段落字号差异约 15%；极拥挤段落允许更小字号，优先保留完整译文。
+      const bodyPlans=plans.filter(plan=>!plan.heading && plan.layout.fontSize>=this.options.compactMinFontSize);
       const commonSize=bodyPlans.length ? Math.min(10.5,...bodyPlans.map(plan=>plan.layout.fontSize/0.85)) : 10.5;
       for (const plan of plans) {
-        if (!plan.heading) plan.layout=this.calculatePdfTextLayout(font,plan.text,plan.width,plan.height,false,true,Math.min(commonSize,plan.layout.fontSize));
+        if (!plan.heading) plan.layout=this.calculatePdfTextLayout(font,plan.text,plan.width,plan.height,false,true,Math.min(commonSize,plan.layout.fontSize),plan.layout.fontSize<this.options.compactMinFontSize);
       }
       // 先验证所有段落，再修改页面，避免部分修改被误下载。
       for (const plan of plans) {
@@ -82,6 +82,12 @@ class PDFExporter {
           page.drawText(line, {x:x+layout.padding,y:top-layout.padding-layout.fontSize-index*layout.lineHeight,
             size:layout.fontSize,font,color:PDFLib.rgb(0,0,0)});
         });
+      }
+      const small=plans.filter(plan=>plan.layout.fontSize<this.options.compactMinFontSize);
+      if(small.length) {
+        const message=`有 ${small.length} 段文字框较拥挤，已使用更小字号保留完整译文，请放大 PDF 查看。`;
+        if(notify)notify(message,'warning');
+        else if(typeof window!=='undefined' && typeof window.showNotification==='function')window.showNotification(message,'warning');
       }
       const bytes = await doc.save();
       if (options.download !== false) {
@@ -125,27 +131,32 @@ class PDFExporter {
     return {x:left,width:right-left};
   }
 
-  calculatePdfTextLayout(font,text,boxWidth,boxHeight,isHeading=false,compact=false,preferredSize=null) {
+  calculatePdfTextLayout(font,text,boxWidth,boxHeight,isHeading=false,compact=false,preferredSize=null,forceFit=false) {
     const padding=Math.min(1,boxHeight*0.03,boxWidth*0.03);
     const availableWidth=boxWidth-padding*2,availableHeight=boxHeight-padding*2;
-    const min=compact?this.options.compactMinFontSize:this.options.minFontSize;
+    let min=compact?this.options.compactMinFontSize:this.options.minFontSize;
     const max=Math.min(this.options.maxFontSize,preferredSize ?? (isHeading?18:10.5));
+    if(forceFit) min=Math.min(min,max);
     if(availableWidth<=0 || availableHeight<=0 || min<=0 || max<min-0.01) return {fits:false};
     const candidate=(size,leading)=>{
       const lines=this.wrapTextForPdf(font,text,availableWidth,size);
       const lineHeight=size*leading;
       const usedHeight=size+(lines.length-1)*lineHeight;
-      const fits=usedHeight<=availableHeight+0.001 && lines.every(line=>font.widthOfTextAtSize(line,size)<=availableWidth+0.01);
+      const fits=usedHeight<=availableHeight+1e-7 && lines.every(line=>font.widthOfTextAtSize(line,size)<=availableWidth+0.01);
       return {fontSize:size,lines,lineHeight,padding,fits};
     };
-    const leadings=compact?[1.2,1.12,1.04]:[1.25];
+    const leadings=compact?(forceFit?[1.2,1.12,1.04,1.0]:[1.2,1.12,1.04]):[1.25];
     // 先保持字号压紧行距，最后才减小字号。
     for(const leading of leadings) {const trial=candidate(max,leading);if(trial.fits)return trial;}
     const leading=leadings[leadings.length-1];
     let best=candidate(min,leading);
+    if(forceFit) {
+      // 解除固定最低字号限制，直到整段真实排入框内；不丢字、不加附页。
+      while(!best.fits && min>Number.MIN_VALUE*2) {min/=2;best=candidate(min,leading);}
+    }
     if(!best.fits)return best;
     let low=min,high=Math.max(min,max);
-    for(let step=0;step<20 && high-low>0.005;step++) {
+    for(let step=0;step<32 && high-low>Math.max(1e-9,low*0.0005);step++) {
       const mid=(low+high)/2,trial=candidate(mid,leading);
       if(trial.fits){best=trial;low=mid;}else high=mid;
     }
