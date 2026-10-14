@@ -5,9 +5,9 @@ class PDFExporter {
     const script = typeof document !== 'undefined' && Array.from(document.scripts).find(item => /\/PDFExporter\.js(?:\?|$)/.test(item.src));
     const root = script ? new URL('../../../', script.src).href : '/';
     this.options = Object.assign({
-      fontUrl: root + 'public/vendor/pdf-export/NotoSansSC-Regular.ttf',
-      pdfLibUrl: root + 'public/vendor/pdf-export/pdf-lib.min.js',
-      fontkitUrl: root + 'public/vendor/pdf-export/fontkit.umd.min.js',
+      fontUrl: root + 'public/vendor/NotoSansSC-Regular.ttf',
+      pdfLibUrl: root + 'public/vendor/pdf-lib.min.js',
+      fontkitUrl: root + 'public/vendor/fontkit.umd.min.js',
       bboxNormalizedRange: 1000,
       minFontSize: 5,
       maxFontSize: 24
