@@ -72,6 +72,7 @@ class MinerUStructuredTranslation {
           break;
 
         default:
+          translatable.type = 'text';
           translatable.text = item.text || item.content || '';
       }
 
@@ -141,6 +142,8 @@ class MinerUStructuredTranslation {
    - 术语保持一致（专有名词、学术术语等）
    - 考虑上文内容（如有），确保术语和表述一致
    - 保持段落间逻辑关系
+   - 中文目标语言必须翻译每一段自然语言正文、页脚说明、作者单位、图题及表题，不得返回整段英文原文；保留作者姓名、网址、DOI、标准缩写及数学变量
+   - 正文内公式用 $...$ 包裹，独立公式用 $$...$$；TeX 命令必须放在公式定界符内，不得散落在正文中
 5. **JSON 格式要求（极其重要）**：
    - 字符串中的特殊字符必须正确转义：
      * 双引号：使用 \\"
@@ -240,7 +243,11 @@ ${jsonContent}
    */
   async translateBatches(batches, targetLang, model, apiKey, options = {}, onProgress, acquireSlot, releaseSlot) {
     // DeepL 是文本翻译接口，不应要求它翻译 JSON 并遵循模型提示词。
-    if (model === 'deeplx') return this.translateDeepLParagraphs(batches, targetLang, apiKey, options, onProgress, acquireSlot, releaseSlot);
+    if (model === 'deeplx') {
+      const results=await this.translateDeepLParagraphs(batches,targetLang,apiKey,options,onProgress,acquireSlot,releaseSlot);
+      await this.repairEnglishParagraphs(results,targetLang,model,apiKey,options,acquireSlot,releaseSlot);
+      return results;
+    }
     const totalBatches = batches.length;
     let completedCount = 0;
 
@@ -671,6 +678,8 @@ ${jsonContent}
       results.push(...result.items);
     }
 
+    await this.repairEnglishParagraphs(results,targetLang,model,apiKey,options,acquireSlot,releaseSlot);
+
     // 统计整体翻译情况
     const totalItems = results.length;
     const failedItems = results.filter(item => item.failed === true);
@@ -736,6 +745,113 @@ ${jsonContent}
       if (typeof onProgress === 'function') onProgress({percentage:Math.round((index+1)/items.length*100),message:`${index+1}/${items.length} 个片段`});
     }
     return results;
+  }
+
+  needsChineseRepair(text) {
+    if(typeof text!=='string')return false;
+    const cleaned=text.replace(/\$\$[\s\S]*?\$\$|\$[^$]*\$|\\([\s\S]*?\\)|\\[[\s\S]*?\\]/g,' ').replace(/https?:\/\/\S+|\S+@\S+|\b10\.\d{4,9}\/\S+/g,' ');
+    const words=cleaned.match(/\b[A-Za-z][A-Za-z'-]{2,}\b/g)||[];
+    const lower=words.filter(word=>/[a-z]/.test(word));
+    const han=(cleaned.match(/[\u3400-\u9fff]/g)||[]).length;
+    return lower.length>=6 && han<lower.join('').length*.65;
+  }
+
+  async repairEnglishParagraphs(results,targetLang,model,apiKey,options,acquireSlot,releaseSlot) {
+    if(!/中文|chinese|\bzh(?:-|$)|简体|繁体/i.test(targetLang))return;
+    for(const item of results) {
+      const fields=item.type==='image'?['image_caption']:item.type==='table'?['table_caption']:['text'];
+      for(const field of fields) {
+        const source=Array.isArray(item[field])?item[field].join('\n'):item[field];
+        if(!this.needsChineseRepair(source) && !(item.renderInParent && typeof source==='string' && /[a-z]{3,}/.test(source) && !/[\u3400-\u9fff]/.test(source) && !/https?:|@|doi/i.test(source)))continue;
+        if(typeof addProgressLog==='function')addProgressLog(`发现原第 ${(item.page_idx||0)+1} 页英文段落，正在补译…`);
+        let fixed=false;
+        for(let attempt=0;attempt<2&&!fixed;attempt++) {
+          if(typeof acquireSlot==='function')await acquireSlot();
+          try {
+            let translated;
+            if(model==='deeplx') {
+              const out=await this.translateDeepLParagraphs([{items:[{type:'text',text:source}]}],targetLang,apiKey,options,null,null,null);
+              translated=out[0]?.failed?null:out[0]?.text;
+            } else {
+              const response=await this.callTranslationAPI('你是学术文献翻译员。将整段自然语言完整译为'+targetLang+'，不得保留英文句子。人名、网址、DOI、专有缩写、变量可保留。数学式必须用 $...$ 包裹。只返回 JSON：{"text":"译文"}。',JSON.stringify({text:source}),model,apiKey,options);
+              const parsed=this.parseTranslationResponse(response);
+              translated=Array.isArray(parsed)?parsed[0]?.text:parsed?.text;
+            }
+            if(typeof translated==='string'&&translated.trim()&&!this.needsChineseRepair(translated) && !(item.renderInParent && /[a-z]{3,}/.test(translated) && !/[\u3400-\u9fff]/.test(translated))) {
+              item[field]=Array.isArray(item[field])?[translated.trim()]:translated.trim();
+              if(item.type==='text'){delete item.failed;delete item.failureReason;}
+              fixed=true;
+            }
+          } catch(error) {if(typeof addProgressLog==='function')addProgressLog('英文补译失败：'+error.message);}
+          finally {if(typeof releaseSlot==='function')releaseSlot();}
+        }
+        if(!fixed) {item.failed=true;item.failureReason='english_remaining';if(typeof addProgressLog==='function')addProgressLog('该段英文仍未成功译出，已标记失败，请重试。');}
+      }
+    }
+  }
+
+  async addMissingPdfText(content,pdfBytes) {
+    if(typeof pdfjsLib==='undefined') {if(typeof addProgressLog==='function')addProgressLog('PDF 文字补漏不可用：PDF.js 未加载');return content;}
+    const task=pdfjsLib.getDocument({data:new Uint8Array(pdfBytes)});
+    let pdf;
+    try {
+      pdf=await task.promise;let added=0;
+      for(let pageIndex=0;pageIndex<pdf.numPages;pageIndex++) {
+        const page=await pdf.getPage(pageIndex+1),viewport=page.getViewport({scale:1});
+        if(viewport.rotation%360!==0)continue;
+        const textContent=await page.getTextContent();
+        const known=content.filter(it=>!it.renderInParent&&(['image','table','formula','equation','isolate_formula'].includes(it.type)||(typeof it.text==='string'&&it.text.trim()))&&it.page_idx===pageIndex&&Array.isArray(it.bbox)&&it.bbox.length===4&&it.bbox.every(Number.isFinite));
+        const missing=[];
+        for(const it of textContent.items) {
+          if(typeof it.str!=='string'||!it.str.trim()||!it.transform)continue;
+          const tr=pdfjsLib.Util.transform(viewport.transform,it.transform);
+          const height=Math.max(1,Math.hypot(tr[2],tr[3])),width=Math.max(1,it.width||height*it.str.length*.5);
+          const box=[tr[4]/viewport.width*1000,(tr[5]-height*.9)/viewport.height*1000,(tr[4]+width)/viewport.width*1000,(tr[5]+height*.25)/viewport.height*1000].map(v=>Math.max(0,Math.min(1000,v)));
+          if(box[2]<=box[0]||box[3]<=box[1])continue;
+          const area=(box[2]-box[0])*(box[3]-box[1]);
+          const coverage=k=>Math.max(0,Math.min(box[2],k.bbox[2])-Math.max(box[0],k.bbox[0]))*Math.max(0,Math.min(box[3],k.bbox[3])-Math.max(box[1],k.bbox[1]))/area;
+          const parent=known.find(k=>['image','table'].includes(k.type)&&coverage(k)>.5);
+          if(parent) {
+            // 可提取的图表文字按原坐标翻译后覆盖；数值、纯缩写和数学变量保持原样。
+            if(parent.id && /[A-Za-z]{2,}/.test(it.str) && /[a-z]/.test(it.str)) {
+              const item={id:`pdf_label_${pageIndex}_${added++}`,type:'text',text:it.str,page_idx:pageIndex,bbox:box,renderInParent:parent.id,recoveredFromPdf:true};
+              item.originalItem={...item};content.push(item);
+            }
+            continue;
+          }
+          const covered=known.some(k=>coverage(k)>.3);
+          if(!covered)missing.push({text:it.str,bbox:box});
+        }
+        // 先按栏、行合并；不跨越双栏，也不把整页漏识别内容挤进一条短行。
+        missing.sort((a,b)=>a.bbox[1]-b.bbox[1]||a.bbox[0]-b.bbox[0]);
+        const lines=[];
+        for(const chunk of missing) {
+          const mid=(chunk.bbox[0]+chunk.bbox[2])/2,lane=mid<500?0:1;
+          const h=chunk.bbox[3]-chunk.bbox[1];
+          const line=lines.find(line=>line.lane===lane && Math.abs(line.bbox[1]-chunk.bbox[1])<h*.45 && chunk.bbox[0]-line.bbox[2]<30 && line.bbox[0]-chunk.bbox[2]<30);
+          if(line) {line.parts.push(chunk);line.bbox=[Math.min(line.bbox[0],chunk.bbox[0]),Math.min(line.bbox[1],chunk.bbox[1]),Math.max(line.bbox[2],chunk.bbox[2]),Math.max(line.bbox[3],chunk.bbox[3])];}
+          else lines.push({lane,bbox:chunk.bbox.slice(),parts:[chunk]});
+        }
+        lines.sort((a,b)=>a.lane-b.lane||a.bbox[1]-b.bbox[1]);
+        const paragraphs=[];
+        for(const line of lines) {
+          line.text=line.parts.sort((a,b)=>a.bbox[0]-b.bbox[0]).map(p=>p.text).join(' ');
+          const prev=paragraphs[paragraphs.length-1],h=line.bbox[3]-line.bbox[1];
+          if(prev&&prev.lane===line.lane&&line.bbox[1]-prev.bbox[3]<h*.9&&Math.abs(line.bbox[0]-prev.bbox[0])<35) {
+            prev.text+=' '+line.text;prev.bbox=[Math.min(prev.bbox[0],line.bbox[0]),prev.bbox[1],Math.max(prev.bbox[2],line.bbox[2]),line.bbox[3]];
+          } else paragraphs.push({lane:line.lane,text:line.text,bbox:line.bbox.slice()});
+        }
+        for(const para of paragraphs) {
+          if(!/[A-Za-z\u3400-\u9fff]/.test(para.text))continue;
+          const item={id:`pdf_missing_${pageIndex}_${added++}`,type:'text',text:para.text,page_idx:pageIndex,bbox:para.bbox,recoveredFromPdf:true};
+          item.originalItem={...item};content.push(item);
+        }
+        page.cleanup();
+      }
+      if(added&&typeof addProgressLog==='function')addProgressLog(`从原 PDF 补回 ${added} 段漏识别文字，已加入翻译。`);
+    } catch(error) {if(typeof addProgressLog==='function')addProgressLog('PDF 文字补漏失败，继续使用 OCR 结果：'+error.message);}
+    finally {if(pdf)await pdf.destroy();else if(task?.destroy)await task.destroy();}
+    return content;
   }
 
   async callTranslationAPI(systemPrompt, userPrompt, model, apiKey, options = {}) {
