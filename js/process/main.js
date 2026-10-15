@@ -757,6 +757,11 @@ const fileType = fileToProcess.name.split('.').pop().toLowerCase();
                             ocrResult.metadata.contentListJson
                         );
 
+                        // 原 PDF 文字补漏：OCR 未返回的正文/页脚也进入翻译。
+                        if (fileType === 'pdf' && typeof fileToProcess.arrayBuffer === 'function') {
+                            await structuredTranslator.addMissingPdfText(translatableContent, await fileToProcess.arrayBuffer());
+                        }
+
                         // 2. 分批
                         const batches = structuredTranslator.splitIntoBatches(translatableContent);
 
